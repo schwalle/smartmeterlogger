@@ -1,0 +1,4 @@
+influxdb-client
+smllib
+pyserial-asyncio
+docopt

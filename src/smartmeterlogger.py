@@ -17,10 +17,9 @@ Options:
 import asyncio
 import serial_asyncio
 
-from typing import Callable, Dict, List, Any
+from typing import Awaitable, List
 from docopt import docopt
 from datetime import datetime
-from rx.core.typing import MapperIndexed
 from smllib import SmlStreamReader
 from smllib.sml_fields import SmlListEntry
 from smllib.sml_frame import SmlFrame
@@ -31,14 +30,13 @@ from influxdb_client.domain.write_precision import WritePrecision
 from detail.obis import Obis, ObisCode
 from detail.helper import create_hex_dump, eprint
 
-class SmlValueReceiver(asyncio.Protocol):
+class SmlFrameReceiver(asyncio.Protocol):
 
-    def __init__(self, desired_obis: List[ObisCode], value_receiver: Callable[[dict], Any]):
+    def __init__(self, framehandler: Awaitable[SmlFrame]):
         super().__init__()
 
-        self.smlstreamreader = SmlStreamReader()
-        self.desired_obis = desired_obis
-        self.value_receiver = value_receiver
+        self._smlstreamreader = SmlStreamReader()
+        self._framehandler = framehandler
 
     def connection_made(self, transport):
         self.transport = transport
@@ -46,16 +44,14 @@ class SmlValueReceiver(asyncio.Protocol):
 
     def data_received(self, data):
         print('data received', repr(data))        
-        self.smlstreamreader.add(data)
-        smlframe = self.smlstreamreader.get_frame()
-        if smlframe is not None:
-            self.dump_sml_frame(smlframe)
-            self.smlstreamreader.clear()
-            extracted_values = self.extract_desired_values(smlframe)
-            self.value_receiver(extracted_values)
+        self._smlstreamreader.add(data)
+        smlframe = self._smlstreamreader.get_frame()
+        if smlframe is not None:                        
+            self.transport.loop.create_task(self._framehandler(smlframe))
+            self._smlstreamreader.clear()
         else:
-            print(f"Current buffer length {len(self.smlstreamreader.bytes)}")
-            print(create_hex_dump(self.smlstreamreader.bytes))
+            print(f"Current buffer length {len(self._smlstreamreader.bytes)}")
+            print(create_hex_dump(self._smlstreamreader.bytes))
 
     def extract_desired_values(self, smlframe: SmlFrame):
         extracted_values = {}
@@ -66,20 +62,33 @@ class SmlValueReceiver(asyncio.Protocol):
                 
         return extracted_values
 
-    def dump_sml_frame(self, smlframe: SmlFrame):
-        for msg in smlframe.parse_frame():
-            print(msg.format_msg())
-
     def connection_lost(self, exc):
         print('port closed')
         self.transport.loop.stop()
 
+class Sml2Influx:
 
-def insertValues(values: Dict[ObisCode, Any], influxwriteapi: WriteApi):
-    point = Point('electricmeter')
-    point._tags.update((oc.name, v) for oc, v in values)
+    def __init__(self, influx: InfluxDBClient) -> None:
+        self._influxclient = influx
+        pass
+
+
+    async def __call__(self, smlframe: SmlFrame) -> None:
+        for smlentry in smlframe.get_obis():
+            print(smlentry.format_msg())
+        pass
+
+    def __repr__(self) -> str:
+        return f'Sml2Influx(influx={self._influxclient})'
+        
+    
+
+async def insertValues(values, influxwriteapi: WriteApi):
+    point = Point('mainelectricmeter')
+    for oc, v in values:
+        point.field(oc.name, v)
     point.time(int(datetime.now().timestamp()), write_precision=WritePrecision.S)
-    influxwriteapi.write('', record=point)
+    influxwriteapi.write('electricmeter', org='schwalle', record=point)
 
 def createInfluxInserter(client: InfluxDBClient):
     write_api = client.write_api(write_options=SYNCHRONOUS)
@@ -97,7 +106,7 @@ def main(arguments):
         client = InfluxDBClient.from_config_file(config_file)
         loop = asyncio.get_event_loop()
         coro = serial_asyncio.create_serial_connection(
-            loop, lambda: SmlValueReceiver(desired_obis_values, createInfluxInserter(client)), arguments['DEVICE'], baudrate=9600, bytesize=8, parity='N', stopbits=1, timeout=1, xonxoff=0, rtscts=0)
+            loop, lambda: SmlFrameReceiver(Sml2Influx(client)), arguments['DEVICE'], baudrate=9600, bytesize=8, parity='N', stopbits=1, timeout=1, xonxoff=0, rtscts=0)
         loop.run_until_complete(coro)
         loop.run_forever()
         loop.close()

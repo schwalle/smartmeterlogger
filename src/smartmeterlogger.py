@@ -51,17 +51,15 @@ class SmlValueReceiver(asyncio.Protocol):
         if smlframe is not None:
             self.dump_sml_frame(smlframe)
             self.smlstreamreader.clear()
-            pass
             extracted_values = self.extract_desired_values(smlframe)
             self.value_receiver(extracted_values)
         else:
             print(f"Current buffer length {len(self.smlstreamreader.bytes)}")
             print(create_hex_dump(self.smlstreamreader.bytes))
 
-    def extract_desired_values(self, smlframe):
+    def extract_desired_values(self, smlframe: SmlFrame):
         extracted_values = {}
-        sml_values: List[SmlListEntry] = list(filter(
-                lambda smlentry: smlentry.obis in [o.obis for o in self.desired_obis]), smlframe.get_obis())
+        sml_values: List[SmlListEntry] = list(filter(lambda smlentry: smlentry.obis in [o.obis for o in self.desired_obis]), smlframe.get_obis())
         for value in sml_values:
             extracted_values[ObisCode.by_obis(
                     value.obis)] = value.get_value()
@@ -76,13 +74,6 @@ class SmlValueReceiver(asyncio.Protocol):
         print('port closed')
         self.transport.loop.stop()
 
-    def pause_writing(self):
-        print('pause writing')
-        print(self.transport.get_write_buffer_size())
-
-    def resume_writing(self):
-        print(self.transport.get_write_buffer_size())
-        print('resume writing')
 
 def insertValues(values: Dict[ObisCode, Any], influxwriteapi: WriteApi):
     point = Point('electricmeter')

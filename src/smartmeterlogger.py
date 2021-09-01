@@ -15,20 +15,22 @@ Options:
 """
 
 import asyncio
-import serial_asyncio
-
-from typing import Awaitable, List
-from docopt import docopt
 from datetime import datetime
-from smllib import SmlStreamReader
-from smllib.sml_fields import SmlListEntry
-from smllib.sml_frame import SmlFrame
+from functools import partial
+from typing import Awaitable, Dict, List
+
+import serial_asyncio
+from docopt import docopt
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS, WriteApi
 from influxdb_client.domain.write_precision import WritePrecision
+from smllib import SmlStreamReader
+from smllib.sml_fields import SmlListEntry
+from smllib.sml_frame import SmlFrame
 
-from detail.obis import Obis, ObisCode
 from detail.helper import create_hex_dump, eprint
+from detail.obis import ObisCode
+
 
 class SmlFrameReceiver(asyncio.Protocol):
 
@@ -42,71 +44,52 @@ class SmlFrameReceiver(asyncio.Protocol):
         self.transport = transport
         print('port opened', transport)
 
-    def data_received(self, data):
-        print('data received', repr(data))        
+    def data_received(self, data):        
         self._smlstreamreader.add(data)
         smlframe = self._smlstreamreader.get_frame()
         if smlframe is not None:                        
             self.transport.loop.create_task(self._framehandler(smlframe))
             self._smlstreamreader.clear()
-        else:
-            print(f"Current buffer length {len(self._smlstreamreader.bytes)}")
-            print(create_hex_dump(self._smlstreamreader.bytes))
-
-    def extract_desired_values(self, smlframe: SmlFrame):
-        extracted_values = {}
-        sml_values: List[SmlListEntry] = list(filter(lambda smlentry: smlentry.obis in [o.obis for o in self.desired_obis]), smlframe.get_obis())
-        for value in sml_values:
-            extracted_values[ObisCode.by_obis(
-                    value.obis)] = value.get_value()
                 
-        return extracted_values
-
     def connection_lost(self, exc):
         print('port closed')
         self.transport.loop.stop()
 
-class Sml2Influx:
+class Sml2InfluxHandler:
 
-    def __init__(self, influx: InfluxDBClient) -> None:
+    def __init__(self, influx: InfluxDBClient, desired_obis: List[ObisCode], bucket: str, org: str, measurement: str) -> None:
         self._influxclient = influx
+        self._write_api = influx.write_api()
+        self._desired_obis = desired_obis
+        self._bucket = bucket        
+        self._org = org        
+        self._measurement = measurement                
         pass
 
 
     async def __call__(self, smlframe: SmlFrame) -> None:
-        for smlentry in smlframe.get_obis():
-            print(smlentry.format_msg())
-        pass
-
-    def __repr__(self) -> str:
-        return f'Sml2Influx(influx={self._influxclient})'
+        get_first_smlentry_by_obis = lambda obis_code: next(smlentry for smlentry in smlframe.get_obis() if smlentry.obis == obis_code.obis)
         
+        point = Point.measurement(self._measurement).time(datetime.utcnow())
+        for oc, smlentry in ((oc, get_first_smlentry_by_obis(oc)) for oc in self._desired_obis):
+            point.field(oc.name, smlentry.get_value())
     
+        if len(point._fields) > 0:
+            self._write_api.write(self._bucket,self._org, point)
 
-async def insertValues(values, influxwriteapi: WriteApi):
-    point = Point('mainelectricmeter')
-    for oc, v in values:
-        point.field(oc.name, v)
-    point.time(int(datetime.now().timestamp()), write_precision=WritePrecision.S)
-    influxwriteapi.write('electricmeter', org='schwalle', record=point)
-
-def createInfluxInserter(client: InfluxDBClient):
-    write_api = client.write_api(write_options=SYNCHRONOUS)
-    return lambda values : insertValues(values, write_api)
 
 def main(arguments):
     config_file = 'config.ini'
     if '-c' in arguments:
         config_file = arguments['-c']
 
-    desired_obis_values = [ObisCode.TOTAL_ZAEHLERSTAND,ObisCode.AKTUELLE_WIRKLEISTUNG, 
-                        ObisCode.WIRKLEISTUNG_L1, ObisCode.WIRKLEISTUNG_L2, ObisCode.WIRKLEISTUNG_L3]
+    desired_obis_values = [ObisCode.ZAEHLERSTAND_TOTAL_BEZUG ,ObisCode.ZAEHLERSTAND_TOTAL_EINSPEISUNG]
 
     try:
         client = InfluxDBClient.from_config_file(config_file)
         loop = asyncio.get_event_loop()
         coro = serial_asyncio.create_serial_connection(
-            loop, lambda: SmlFrameReceiver(Sml2Influx(client)), arguments['DEVICE'], baudrate=9600, bytesize=8, parity='N', stopbits=1, timeout=1, xonxoff=0, rtscts=0)
+            loop, lambda: SmlFrameReceiver(Sml2InfluxHandler(client,desired_obis_values,'home','schwalle', 'mainelectricmeter')), arguments['DEVICE'], baudrate=9600, bytesize=8, parity='N', stopbits=1, timeout=1, xonxoff=0, rtscts=0)
         loop.run_until_complete(coro)
         loop.run_forever()
         loop.close()
